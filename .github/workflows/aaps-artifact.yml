@@ -1,0 +1,109 @@
+name: AAPS Build (Artifact)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tagName:
+        description: 'AAPS version tag (np. 3.4.2.3)'
+        required: true
+        default: '3.4.2.3'
+        type: string
+      buildVariant:
+        description: 'Build variant'
+        required: true
+        default: 'fullRelease'
+        type: choice
+        options: [fullRelease, fullDebug, aapsclientRelease, aapsclient2Release, pumpcontrolRelease]
+
+jobs:
+  build:
+    name: Build AAPS (artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Decode keystore secret
+        run: |
+          if [ -z "${{ secrets.KEYSTORE_SET }}" ]; then
+            echo "Missing secret KEYSTORE_SET"; exit 1
+          fi
+          DECODED=$(echo "${{ secrets.KEYSTORE_SET }}" | base64 -d)
+          KB=$(echo "$DECODED" | cut -d'|' -f1)
+          KP=$(echo "$DECODED" | cut -d'|' -f2)
+          KA=$(echo "$DECODED" | cut -d'|' -f3)
+          KW=$(echo "$DECODED" | cut -d'|' -f4)
+          echo "::add-mask::$KB"; echo "::add-mask::$KP"; echo "::add-mask::$KA"; echo "::add-mask::$KW"
+          echo "KEYSTORE_BASE64=$KB" >> $GITHUB_ENV
+          echo "KEYSTORE_PASSWORD=$KP" >> $GITHUB_ENV
+          echo "KEY_ALIAS=$KA" >> $GITHUB_ENV
+          echo "KEY_PASSWORD=$KW" >> $GITHUB_ENV
+
+      - name: Write keystore file
+        run: |
+          mkdir -p "$RUNNER_TEMP/keystore"
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/keystore/keystore.jks"
+
+      - name: Checkout (fork)
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Determine JDK from jdk-map.json
+        run: |
+          TAG="${{ github.event.inputs.tagName }}"
+          JAVA_VERSION=$(jq -r '.default' .github/jdk-map.json)
+          while IFS=$'\t' read -r pattern jdk; do
+            if [[ "$TAG" == $pattern ]]; then JAVA_VERSION="$jdk"; break; fi
+          done < <(jq -r '.mappings[] | "\(.pattern)\t\(.jdk)"' .github/jdk-map.json)
+          echo "JAVA_VERSION=$JAVA_VERSION" >> $GITHUB_ENV
+          echo "Tag $TAG -> JDK $JAVA_VERSION"
+
+      - name: Fetch & checkout tag from upstream
+        run: |
+          git remote add upstream https://github.com/nightscout/AndroidAPS.git || true
+          git fetch upstream refs/tags/${{ github.event.inputs.tagName }}:refs/tags/${{ github.event.inputs.tagName }} || true
+          git checkout refs/tags/${{ github.event.inputs.tagName }} || git checkout ${{ github.event.inputs.tagName }}
+
+      - name: Set variant vars
+        run: |
+          BV="${{ github.event.inputs.buildVariant }}"
+          echo "BUILD_VARIANT=$BV" >> $GITHUB_ENV
+          echo "VARIANT_FLAVOR=$(echo "$BV" | sed -E 's/(Release|Debug)$//' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+          echo "VARIANT_TYPE=$(echo "$BV" | grep -oE '(Release|Debug)$' | tr '[:upper:]' '[:lower:]')" >> $GITHUB_ENV
+
+      - name: Extract VERSION
+        run: |
+          V=$(grep 'val appVersion' buildSrc/src/main/kotlin/Versions.kt | awk -F '"' '{print $2}')
+          echo "VERSION=$V" >> $GITHUB_ENV
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: 'temurin'
+          cache: gradle
+
+      - name: Build & sign APK
+        run: |
+          chmod +x gradlew
+          ./gradlew :app:assemble${{ env.BUILD_VARIANT }} \
+            -Dorg.gradle.jvmargs="-Xmx8g -XX:+UseParallelGC -Xss1024m" \
+            -Dkotlin.compiler.execution.strategy="in-process" \
+            -Dorg.gradle.workers.max=8 \
+            -Dorg.gradle.caching=true \
+            -Pandroid.injected.signing.store.file="$RUNNER_TEMP/keystore/keystore.jks" \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+
+      - name: Collect APK
+        run: |
+          mkdir -p out
+          cp app/build/outputs/apk/${{ env.VARIANT_FLAVOR }}/${{ env.VARIANT_TYPE }}/*.apk \
+             out/aaps-${{ env.VERSION }}-${{ env.BUILD_VARIANT }}.apk
+          ls -lh out/
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: aaps-${{ env.VERSION }}-${{ env.BUILD_VARIANT }}
+          path: out/*.apk
+          retention-days: 14
